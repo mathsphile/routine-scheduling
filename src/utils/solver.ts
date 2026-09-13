@@ -14,7 +14,7 @@ const TIME_SLOTS: TimeSlot[] = ['10:00 - 12:00', '12:00 - 02:00', '02:30 - 04:30
 
 interface UnscheduledItem {
   subject: Subject;
-  sessionIndex: number; // e.g. session 1 of 2
+  sessionIndex: number;
 }
 
 export function solveTimetable(
@@ -28,12 +28,10 @@ export function solveTimetable(
   const teacherMap = new Map<string, Teacher>(teachers.map(t => [t.id, t]));
 
   // Assign designated free days for internal teachers to guarantee internal teacher free day constraint
-  // E.g. spread across Mon-Sat
   const internalTeachers = teachers.filter(t => t.type === 'Internal');
   const internalTeacherFreeDays: Record<string, DayOfWeek> = {};
 
   internalTeachers.forEach((teacher, idx) => {
-    // Pick a day that is NOT in teacher's top preference if possible, or distribute evenly
     const preferredDays = new Set(teacher.preferences.map(p => p.day));
     const nonPrefDay = DAYS.find(d => !preferredDays.has(d));
     if (nonPrefDay) {
@@ -52,14 +50,10 @@ export function solveTimetable(
   }
 
   // Tracking state structures
-  // teacherBookings: `${teacherId}_${day}_${timeSlot}` => boolean
   const teacherBookings = new Set<string>();
-  // roomBookings: `${roomId}_${day}_${timeSlot}` => boolean
   const roomBookings = new Set<string>();
-  // batchBookings: `${program}_${semester}_${day}_${timeSlot}` => boolean
   const batchBookings = new Set<string>();
 
-  // Teacher daily counts: teacherId -> day -> { theory: number, practical: number }
   const teacherDailyCounts = new Map<string, Map<DayOfWeek, { theory: number; practical: number }>>();
   for (const t of teachers) {
     const dayMap = new Map<DayOfWeek, { theory: number; practical: number }>();
@@ -69,7 +63,6 @@ export function solveTimetable(
     teacherDailyCounts.set(t.id, dayMap);
   }
 
-  // Subject daily scheduled: subjectId -> Set<DayOfWeek> (avoid 2 sessions of same subject on same day if sessionsPerWeek <= 3)
   const subjectScheduledDays = new Map<string, Set<DayOfWeek>>();
   for (const s of subjects) {
     subjectScheduledDays.set(s.id, new Set());
@@ -79,7 +72,6 @@ export function solveTimetable(
   const unassigned: Subject[] = [];
 
   // Sort items to schedule using MRV & Constrained First heuristic:
-  // Practicals / Labs first (constrained rooms), then subjects with external teachers, then higher sessions count
   itemsToSchedule.sort((a, b) => {
     if (a.subject.type === 'Practical' && b.subject.type !== 'Practical') return -1;
     if (a.subject.type !== 'Practical' && b.subject.type === 'Practical') return 1;
@@ -90,18 +82,27 @@ export function solveTimetable(
     return b.subject.sessionsPerWeek - a.subject.sessionsPerWeek;
   });
 
-  // Backtracking function
+  let stepCount = 0;
+  const MAX_STEPS = 15000;
+  const MAX_TIME_MS = 80;
+
+  // Backtracking function with timeout & max step guards
   function backtrack(index: number): boolean {
     if (index >= itemsToSchedule.length) {
       return true; // All sessions successfully scheduled!
     }
 
+    stepCount++;
+    if (stepCount > MAX_STEPS || (performance.now() - startTime) > MAX_TIME_MS) {
+      return false; // Time/step limit reached, fall back to relaxed solver to avoid freezing UI
+    }
+
     const item = itemsToSchedule[index];
     const subject = item.subject;
-    const teacher = teacherMap.get(subject.teacherId)!;
+    const teacher = teacherMap.get(subject.teacherId);
+    if (!teacher) return false;
     const freeDay = internalTeacherFreeDays[teacher.id];
 
-    // Generate possible candidate slots (day, timeSlot, room)
     interface Candidate {
       day: DayOfWeek;
       timeSlot: TimeSlot;
@@ -114,10 +115,10 @@ export function solveTimetable(
     for (const day of DAYS) {
       // Rule: Internal Teacher Free Day
       if (teacher.type === 'Internal' && day === freeDay) {
-        continue; // Teacher has designated free day on this day
+        continue;
       }
 
-      // Rule: Avoid duplicate sessions of same subject on same day if sessionsPerWeek <= 3
+      // Rule: Avoid duplicate sessions of same subject on same day
       if (subjectScheduledDays.get(subject.id)!.has(day) && subject.sessionsPerWeek <= 5) {
         continue;
       }
@@ -125,15 +126,12 @@ export function solveTimetable(
       // Check Teacher Daily Limits
       const tDaily = teacherDailyCounts.get(teacher.id)!.get(day)!;
       if (subject.type === 'Theory' && tDaily.theory >= 1) {
-        // Teacher can NOT have more than 1 theory class per day
         continue;
       }
       if (subject.type === 'Practical' && tDaily.practical >= 1) {
-        // Avoid >1 practical per day
         continue;
       }
       if (tDaily.theory + tDaily.practical >= 2) {
-        // Max 2 classes total per day (1 theory + 1 practical)
         continue;
       }
 
@@ -142,24 +140,18 @@ export function solveTimetable(
         const tKey = `${teacher.id}_${timeKey}`;
         const bKey = `${subject.program}_Sem${subject.semester}_${timeKey}`;
 
-        // Check if teacher or batch is already booked
         if (teacherBookings.has(tKey) || batchBookings.has(bKey)) {
           continue;
         }
 
-        // Check available rooms matching facility requirements
         for (const room of rooms) {
-          // Room type match for practical labs
           if (subject.type === 'Practical' && room.type !== 'Lab') {
-            // Prefer labs for practicals
             continue;
           }
           if (subject.type === 'Theory' && room.type === 'Lab') {
-            // Keep labs free for practicals
             continue;
           }
 
-          // Facility check
           if (!isFacilitySatisfied(subject.requiredFacility, room.facility)) {
             continue;
           }
@@ -169,13 +161,12 @@ export function solveTimetable(
             continue;
           }
 
-          // Calculate teacher preference score
           let score = 0;
           const prefIndex = teacher.preferences.findIndex(
             p => p.day === day && p.timeSlot === timeSlot
           );
           if (prefIndex !== -1) {
-            score = 100 - prefIndex * 20; // 100 for 1st pref, 80 for 2nd, 60 for 3rd
+            score = 100 - prefIndex * 20;
             const prefFacility = teacher.preferences[prefIndex].facility;
             if (isFacilitySatisfied(prefFacility, room.facility)) {
               score += 10;
@@ -187,10 +178,8 @@ export function solveTimetable(
       }
     }
 
-    // Sort candidates by highest preference score first
     candidates.sort((a, b) => b.preferenceScore - a.preferenceScore);
 
-    // Try candidates
     for (const candidate of candidates) {
       const { day, timeSlot, room, preferenceScore } = candidate;
       const timeKey = `${day}_${timeSlot}`;
@@ -198,7 +187,6 @@ export function solveTimetable(
       const rKey = `${room.id}_${timeKey}`;
       const bKey = `${subject.program}_Sem${subject.semester}_${timeKey}`;
 
-      // Make Move
       teacherBookings.add(tKey);
       roomBookings.add(rKey);
       batchBookings.add(bKey);
@@ -233,7 +221,6 @@ export function solveTimetable(
         return true;
       }
 
-      // Undo Move (Backtrack)
       assignedSessions.pop();
       teacherBookings.delete(tKey);
       roomBookings.delete(rKey);
@@ -245,27 +232,99 @@ export function solveTimetable(
       subjectScheduledDays.get(subject.id)!.delete(day);
     }
 
-    // If no candidate worked, add subject to unassigned (if fallback mode needed)
     return false;
   }
 
-  const success = backtrack(0);
+  let success = backtrack(0);
+
+  // Fallback Phase: If strict hard-constrained backtrack hit limits or incomplete, schedule remaining sessions gracefully
+  if (assignedSessions.length < itemsToSchedule.length) {
+    for (let i = assignedSessions.length; i < itemsToSchedule.length; i++) {
+      const item = itemsToSchedule[i];
+      const subject = item.subject;
+      const teacher = teacherMap.get(subject.teacherId);
+      if (!teacher) continue;
+
+      let bestSlot: { day: DayOfWeek; timeSlot: TimeSlot; room: Room } | null = null;
+      let minConflicts = Infinity;
+
+      for (const day of DAYS) {
+        for (const timeSlot of TIME_SLOTS) {
+          const timeKey = `${day}_${timeSlot}`;
+          const tKey = `${teacher.id}_${timeKey}`;
+          const bKey = `${subject.program}_Sem${subject.semester}_${timeKey}`;
+
+          let conflictScore = 0;
+          if (teacherBookings.has(tKey)) conflictScore += 100;
+          if (batchBookings.has(bKey)) conflictScore += 100;
+
+          for (const room of rooms) {
+            const rKey = `${room.id}_${timeKey}`;
+            let currentConflict = conflictScore;
+            if (roomBookings.has(rKey)) currentConflict += 100;
+
+            if (currentConflict < minConflicts) {
+              minConflicts = currentConflict;
+              bestSlot = { day, timeSlot, room };
+            }
+          }
+        }
+      }
+
+      if (bestSlot) {
+        const { day, timeSlot, room } = bestSlot;
+        const timeKey = `${day}_${timeSlot}`;
+        const tKey = `${teacher.id}_${timeKey}`;
+        const rKey = `${room.id}_${timeKey}`;
+        const bKey = `${subject.program}_Sem${subject.semester}_${timeKey}`;
+
+        teacherBookings.add(tKey);
+        roomBookings.add(rKey);
+        batchBookings.add(bKey);
+
+        const session: ScheduledSession = {
+          id: `SESS-${i + 1}-${subject.code}`,
+          subjectId: subject.id,
+          subjectCode: subject.code,
+          subjectName: subject.name,
+          program: subject.program,
+          semester: subject.semester,
+          type: subject.type,
+          teacherId: teacher.id,
+          teacherName: teacher.name,
+          teacherType: teacher.type,
+          roomId: room.id,
+          roomName: room.name,
+          day,
+          timeSlot,
+          isPreferenceSatisfied: false
+        };
+
+        assignedSessions.push(session);
+      } else {
+        if (!unassigned.some(u => u.id === subject.id)) {
+          unassigned.push(subject);
+        }
+      }
+    }
+  }
+
   const endTime = performance.now();
   const solverTimeMs = Math.round(endTime - startTime);
 
-  // Calculate statistics & preference satisfaction
   const totalSatisfied = assignedSessions.filter(s => s.isPreferenceSatisfied).length;
   const prefRate = assignedSessions.length > 0
     ? Math.round((totalSatisfied / assignedSessions.length) * 100)
     : 0;
 
   const violations = validateSchedule(assignedSessions, subjects, teachers, rooms);
+  success = assignedSessions.length === itemsToSchedule.length && violations.length === 0;
 
   const totalTheory = assignedSessions.filter(s => s.type === 'Theory').length;
   const totalPractical = assignedSessions.filter(s => s.type === 'Practical').length;
 
   return {
-    success: success && violations.length === 0,
+    success,
     schedule: assignedSessions,
     unassignedSubjects: unassigned,
     preferenceSatisfactionRate: prefRate,

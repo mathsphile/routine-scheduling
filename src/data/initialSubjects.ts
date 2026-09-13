@@ -230,7 +230,7 @@ export const initialSubjects: Subject[] = [
     program: 'M.Sc',
     semester: 1,
     type: 'Theory',
-    teacherId: 'T_INT_101', // Turing
+    teacherId: 'T_INT_102', // Lovelace
     requiredFacility: 'Blackboard',
     sessionsPerWeek: 2
   },
